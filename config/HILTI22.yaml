@@ -59,6 +59,7 @@ visual:
   keyframe_rot_thresh: 30.0
   keyframe_scale_min: 0.3
   max_points_per_voxel: 30
+  long_term_max_points_per_voxel: 10
   point_max_age: 50
   downsample_ratio: 0.5
   patch_pyrimid_level: 4
@@ -90,9 +91,14 @@ lio:
   layer_init_num: [5, 5, 5, 5, 5]
 
 local_map:  
-  map_sliding_en: false
+  map_sliding_en: true
   half_map_size: 100
   sliding_thresh: 8
+
+long_term_map:
+  map_sliding_en: true
+  half_map_size: 400
+  sliding_thresh: 40
 
 uav:
   imu_rate_odom: false

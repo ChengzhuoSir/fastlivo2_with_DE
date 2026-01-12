@@ -100,6 +100,10 @@ public:
   int max_points_per_voxel = 30;
   int point_max_age = 50;
   double downsample_ratio = 0.5;
+  int long_term_max_points_per_voxel = 10;
+  bool long_term_map_sliding_en = false;
+  int long_term_half_map_size = 400;
+  double long_term_sliding_thresh = 40.0;
 
   StatesGroup imu_propagate, latest_ekf_state;
 

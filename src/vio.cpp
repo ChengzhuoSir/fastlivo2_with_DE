@@ -33,6 +33,8 @@ VIOManager::~VIOManager()
   warp_map.clear();
   for (auto& pair : feat_map) delete pair.second;
   feat_map.clear();
+  for (auto& pair : long_term_feat_map) delete pair.second;
+  long_term_feat_map.clear();
 }
 
 // 【核心功能】设置 IMU 到 LiDAR 的外参
@@ -301,6 +303,72 @@ void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
   }
 }
 
+// 【核心功能】将视觉点插入长期视觉地图
+// 【输入/输出】输入: 新视觉点; 输出: 更新长期地图索引
+void VIOManager::insertPointIntoLongTermMap(VisualPoint *pt_new)
+{
+  if (pt_new == nullptr) return;
+  if (long_term_max_points_per_voxel <= 0)
+  {
+    delete pt_new;
+    return;
+  }
+  if (pt_new->obs_.empty())
+  {
+    delete pt_new;
+    return;
+  }
+  V3D pt_w(pt_new->pos_[0], pt_new->pos_[1], pt_new->pos_[2]);
+  double voxel_size = 0.5;
+  float loc_xyz[3];
+  for (int j = 0; j < 3; j++)
+  {
+    loc_xyz[j] = pt_w[j] / voxel_size;
+    if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
+  }
+  VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+  auto iter = long_term_feat_map.find(position);
+  if (iter != long_term_feat_map.end())
+  {
+    auto &points = iter->second->voxel_points;
+    if (points.size() >= static_cast<size_t>(long_term_max_points_per_voxel))
+    {
+      size_t remove_index = 0;
+      size_t min_obs = std::numeric_limits<size_t>::max();
+      for (size_t i = 0; i < points.size(); i++)
+      {
+        if (points[i] == nullptr) continue;
+        size_t obs_size = points[i]->obs_.size();
+        if (obs_size < min_obs)
+        {
+          min_obs = obs_size;
+          remove_index = i;
+        }
+      }
+      size_t removed_obs = 0;
+      if (points[remove_index] != nullptr)
+      {
+        removed_obs = points[remove_index]->obs_.size();
+      }
+      std::ostringstream log_stream;
+      log_stream << "[VIO Prune] utc=" << GetUtcNowString() << " reason=long_term_max_points voxel=(" << position.x << "," << position.y
+                 << "," << position.z << ") max_points=" << long_term_max_points_per_voxel << " cur_points=" << points.size()
+                 << " removed_obs=" << removed_obs;
+      WriteRuntimeLog(log_stream.str());
+      if (points[remove_index] != nullptr) { delete points[remove_index]; }
+      points.erase(points.begin() + remove_index);
+    }
+    points.push_back(pt_new);
+    iter->second->count++;
+  }
+  else
+  {
+    VOXEL_POINTS *ot = new VOXEL_POINTS(0);
+    ot->voxel_points.push_back(pt_new);
+    long_term_feat_map[position] = ot;
+  }
+}
+
 // 【核心功能】根据平面单应性计算仿射变换矩阵
 // 【输入/输出】输入: 参考像素与法向; 输出: 仿射矩阵
 void VIOManager::getWarpMatrixAffineHomography(const vk::AbstractCamera &cam, const V2D &px_ref, const V3D &xyz_ref, const V3D &normal_ref,
@@ -423,7 +491,7 @@ double VIOManager::calculateNCC(float *ref_patch, float *cur_patch, int patch_si
 // 【输入/输出】输入: 当前图像与体素地图; 输出: 更新检索缓存
 void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map)
 {
-  if (feat_map.size() <= 0) return;
+  if (feat_map.empty() && long_term_feat_map.empty()) return;
   double ts0 = omp_get_wtime();
 
   // pg_down->reserve(feat_map.size());
@@ -449,6 +517,42 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
   // t_insert=t_depth=t_position=0;
 
   int loc_xyz[3];
+
+  auto appendFromVoxel = [&](VOXEL_POINTS *voxel) -> bool
+  {
+    bool voxel_in_fov = false;
+    std::vector<VisualPoint *> &voxel_points = voxel->voxel_points;
+    int voxel_num = voxel_points.size();
+
+    for (int i = 0; i < voxel_num; i++)
+    {
+      VisualPoint *pt = voxel_points[i];
+      if (pt == nullptr) continue;
+      if (pt->obs_.size() == 0) continue;
+
+      V3D norm_vec(new_frame_->T_f_w_.rotation_matrix() * pt->normal_);
+      V3D dir(new_frame_->T_f_w_ * pt->pos_);
+      if (dir[2] < 0) continue;
+      // dir.normalize();
+      // if (dir.dot(norm_vec) <= 0.17) continue; // 0.34 70 degree  0.17 80 degree 0.08 85 degree
+
+      V2D pc(worldToCam(pt->pos_));
+      if (isInFrame(pc, border))
+      {
+        voxel_in_fov = true;
+        int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
+        grid_num[index] = TYPE_MAP;
+        Vector3d obs_vec(new_frame_->pos() - pt->pos_);
+        float cur_dist = obs_vec.norm();
+        if (cur_dist <= map_dist[index])
+        {
+          map_dist[index] = cur_dist;
+          retrieve_voxel_points[index] = pt;
+        }
+      }
+    }
+    return voxel_in_fov;
+  };
 
   // printf("A0. initial depthmap: %.6lf \n", omp_get_wtime() - ts0);
   // double ts1 = omp_get_wtime();
@@ -518,43 +622,24 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
     // double t4 = omp_get_wtime();
     auto corre_voxel = feat_map.find(position);
     // double t5 = omp_get_wtime();
+    bool has_voxel = false;
+    bool voxel_in_fov = false;
 
     if (corre_voxel != feat_map.end())
     {
-      bool voxel_in_fov = false;
-      std::vector<VisualPoint *> &voxel_points = corre_voxel->second->voxel_points;
-      int voxel_num = voxel_points.size();
-
-      for (int i = 0; i < voxel_num; i++)
-      {
-        VisualPoint *pt = voxel_points[i];
-        if (pt == nullptr) continue;
-        if (pt->obs_.size() == 0) continue;
-
-        V3D norm_vec(new_frame_->T_f_w_.rotation_matrix() * pt->normal_);
-        V3D dir(new_frame_->T_f_w_ * pt->pos_);
-        if (dir[2] < 0) continue;
-        // dir.normalize();
-        // if (dir.dot(norm_vec) <= 0.17) continue; // 0.34 70 degree  0.17 80 degree 0.08 85 degree
-
-        V2D pc(worldToCam(pt->pos_));
-        if (isInFrame(pc, border))
-        {
-          // cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 3, cv::Scalar(0, 255, 255), -1, 8);
-          voxel_in_fov = true;
-          int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
-          grid_num[index] = TYPE_MAP;
-          Vector3d obs_vec(new_frame_->pos() - pt->pos_);
-          float cur_dist = obs_vec.norm();
-          if (cur_dist <= map_dist[index])
-          {
-            map_dist[index] = cur_dist;
-            retrieve_voxel_points[index] = pt;
-          }
-        }
-      }
-      if (!voxel_in_fov) { DeleteKeyList.push_back(position); }
+      has_voxel = true;
+      voxel_in_fov = appendFromVoxel(corre_voxel->second);
     }
+    if (!voxel_in_fov)
+    {
+      auto corre_long_term = long_term_feat_map.find(position);
+      if (corre_long_term != long_term_feat_map.end())
+      {
+        has_voxel = true;
+        voxel_in_fov = appendFromVoxel(corre_long_term->second);
+      }
+    }
+    if (has_voxel && !voxel_in_fov) { DeleteKeyList.push_back(position); }
   }
 
   // 【步骤】可选射线采样补充可见体素
@@ -591,73 +676,40 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
         auto corre_sub_feat_map = sub_feat_map.find(sample_pos);
         if (corre_sub_feat_map != sub_feat_map.end()) break;
 
+        bool voxel_in_fov = false;
         auto corre_feat_map = feat_map.find(sample_pos);
         if (corre_feat_map != feat_map.end())
         {
-          bool voxel_in_fov = false;
-
-          std::vector<VisualPoint *> &voxel_points = corre_feat_map->second->voxel_points;
-          int voxel_num = voxel_points.size();
-          if (voxel_num == 0) continue;
-
-          for (int j = 0; j < voxel_num; j++)
-          {
-            VisualPoint *pt = voxel_points[j];
-
-            if (pt == nullptr) continue;
-            if (pt->obs_.size() == 0) continue;
-
-            // sub_map_ray.push_back(pt); // cloud_visual_sub_map
-            // add_sample = true;
-
-            V3D norm_vec(new_frame_->T_f_w_.rotation_matrix() * pt->normal_);
-            V3D dir(new_frame_->T_f_w_ * pt->pos_);
-            if (dir[2] < 0) continue;
-            dir.normalize();
-            // if (dir.dot(norm_vec) <= 0.17) continue; // 0.34 70 degree 0.17 80 degree 0.08 85 degree
-
-            V2D pc(worldToCam(pt->pos_));
-
-            if (isInFrame(pc, border))
-            {
-              // cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 3, cv::Scalar(255, 255, 0), -1, 8); 
-              // sub_map_ray_fov.push_back(pt);
-
-              voxel_in_fov = true;
-              int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
-              grid_num[index] = TYPE_MAP;
-              Vector3d obs_vec(new_frame_->pos() - pt->pos_);
-
-              float cur_dist = obs_vec.norm();
-
-              if (cur_dist <= map_dist[index])
-              {
-                map_dist[index] = cur_dist;
-                retrieve_voxel_points[index] = pt;
-              }
-            }
-          }
-
-          if (voxel_in_fov) sub_feat_map[sample_pos] = 0;
-          break;
+          voxel_in_fov = appendFromVoxel(corre_feat_map->second);
         }
         else
         {
-          VOXEL_LOCATION sample_pos(loc_xyz[0], loc_xyz[1], loc_xyz[2]);
-          auto iter = plane_map.find(sample_pos);
-          if (iter != plane_map.end())
+          auto corre_long_term = long_term_feat_map.find(sample_pos);
+          if (corre_long_term != long_term_feat_map.end())
           {
-            VoxelOctoTree *current_octo;
-            current_octo = iter->second->find_correspond(sample_point_w);
-            if (current_octo->plane_ptr_->is_plane_)
-            {
-              pointWithVar plane_center;
-              VoxelPlane &plane = *current_octo->plane_ptr_;
-              plane_center.point_w = plane.center_;
-              plane_center.normal = plane.normal_;
-              visual_submap->add_from_voxel_map.push_back(plane_center);
-              break;
-            }
+            voxel_in_fov = appendFromVoxel(corre_long_term->second);
+          }
+        }
+
+        if (voxel_in_fov)
+        {
+          sub_feat_map[sample_pos] = 0;
+          break;
+        }
+
+        auto iter = plane_map.find(sample_pos);
+        if (iter != plane_map.end())
+        {
+          VoxelOctoTree *current_octo;
+          current_octo = iter->second->find_correspond(sample_point_w);
+          if (current_octo->plane_ptr_->is_plane_)
+          {
+            pointWithVar plane_center;
+            VoxelPlane &plane = *current_octo->plane_ptr_;
+            plane_center.point_w = plane.center_;
+            plane_center.normal = plane.normal_;
+            visual_submap->add_from_voxel_map.push_back(plane_center);
+            break;
           }
         }
       }
@@ -1019,17 +1071,7 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
       log_stream << "[VIO Prune] utc=" << GetUtcNowString() << " reason=age voxel=(" << position.x << "," << position.y
                  << "," << position.z << ") age=" << age << " max_age=" << point_max_age << " last_obs_id=" << last_obs_id;
       WriteRuntimeLog(log_stream.str());
-      auto iter = feat_map.find(position);
-      if (iter != feat_map.end())
-      {
-        auto &points = iter->second->voxel_points;
-        points.erase(std::remove(points.begin(), points.end(), pt), points.end());
-        if (points.empty())
-        {
-          delete iter->second;
-          feat_map.erase(iter);
-        }
-      }
+      RemovePointFromMaps(pt);
       delete pt;
       visual_submap->voxel_points[i] = nullptr;
       continue;
@@ -1901,11 +1943,85 @@ V3F VIOManager::getInterpolatedPixel(cv::Mat img, V2D pc)
   return pixel;
 }
 
-// 【核心功能】裁剪局部视觉地图，清理超出范围的点
+// 【核心功能】从指定视觉地图中移除视觉点
+void VIOManager::RemovePointFromMap(unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> &map, VisualPoint *pt)
+{
+  if (pt == nullptr) return;
+  double voxel_size = 0.5;
+  float loc_xyz[3];
+  for (int j = 0; j < 3; j++)
+  {
+    loc_xyz[j] = pt->pos_[j] / voxel_size;
+    if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
+  }
+  VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+  auto iter = map.find(position);
+  if (iter == map.end()) return;
+
+  auto &points = iter->second->voxel_points;
+  points.erase(std::remove(points.begin(), points.end(), pt), points.end());
+  if (points.empty())
+  {
+    delete iter->second;
+    map.erase(iter);
+  }
+}
+
+// 【核心功能】从局部与长期视觉地图中移除视觉点
+void VIOManager::RemovePointFromMaps(VisualPoint *pt)
+{
+  RemovePointFromMap(feat_map, pt);
+  RemovePointFromMap(long_term_feat_map, pt);
+}
+
+// 【核心功能】裁剪局部视觉地图并转移超出范围的点
 void VIOManager::TrimVisualMap(const V3D &center, double radius)
 {
   double radius_sqr = radius * radius;
   for (auto iter = feat_map.begin(); iter != feat_map.end(); )
+  {
+    auto &points = iter->second->voxel_points;
+    for (auto it = points.begin(); it != points.end(); )
+    {
+      VisualPoint *pt = *it;
+      if (pt == nullptr)
+      {
+        it = points.erase(it);
+        continue;
+      }
+      if ((pt->pos_ - center).squaredNorm() > radius_sqr)
+      {
+        if (!pt->obs_.empty())
+        {
+          insertPointIntoLongTermMap(pt);
+        }
+        else
+        {
+          delete pt;
+        }
+        it = points.erase(it);
+        continue;
+      }
+      ++it;
+    }
+
+    if (points.empty())
+    {
+      delete iter->second;
+      iter = feat_map.erase(iter);
+    }
+    else
+    {
+      ++iter;
+    }
+  }
+}
+
+// 【核心功能】裁剪长期视觉地图，清理超出范围的点
+void VIOManager::TrimLongTermMap(const V3D &center, double radius)
+{
+  double radius_sqr = radius * radius;
+  for (auto iter = long_term_feat_map.begin(); iter != long_term_feat_map.end(); )
   {
     auto &points = iter->second->voxel_points;
     for (auto it = points.begin(); it != points.end(); )
@@ -1928,13 +2044,30 @@ void VIOManager::TrimVisualMap(const V3D &center, double radius)
     if (points.empty())
     {
       delete iter->second;
-      iter = feat_map.erase(iter);
+      iter = long_term_feat_map.erase(iter);
     }
     else
     {
       ++iter;
     }
   }
+}
+
+// 【核心功能】基于位移阈值滑动长期视觉地图
+void VIOManager::UpdateLongTermMapSliding(const V3D &center)
+{
+  if (!long_term_map_sliding_en) return;
+  if (!has_long_term_slide_position_)
+  {
+    long_term_last_slide_position_ = center;
+    has_long_term_slide_position_ = true;
+    return;
+  }
+  if ((center - long_term_last_slide_position_).norm() < long_term_sliding_thresh) return;
+
+  long_term_last_slide_position_ = center;
+  double radius = long_term_half_map_size * 0.5;
+  TrimLongTermMap(center, radius);
 }
 
 // 【核心功能】世界坐标投影到图像像素
@@ -2083,6 +2216,7 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   printf("\033[1;34m|                         VIO Time                            |\033[0m\n");
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
   printf("\033[1;34m| %-29s | %-27zu |\033[0m\n", "Sparse Map Size", feat_map.size());
+  printf("\033[1;34m| %-29s | %-27zu |\033[0m\n", "Long-Term Map Size", long_term_feat_map.size());
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
   printf("\033[1;34m| %-29s | %-27s |\033[0m\n", "Algorithm Stage", "Time (secs)");
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");

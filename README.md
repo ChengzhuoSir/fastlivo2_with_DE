@@ -88,7 +88,11 @@
    - 同步更新相机内参与 `image_resize_factor`。
 
 5. 新增 `TrimVisualMap(center, radius)`：
-   - 删除超出局部地图半径的视觉点。
+   - 将超出局部地图半径的视觉点转移到长期视觉地图。
+
+6. 新增长期视觉地图：
+   - `long_term_feat_map` 存储稀疏历史点。
+   - `UpdateLongTermMapSliding` 按更大尺度滑动裁剪长期地图。
 
 ## 3) 参数落地（`config/*.yaml` 新增项）
 ```
@@ -99,6 +103,7 @@ visual:
   keyframe_rot_thresh: 30.0
   keyframe_scale_min: 0.3
   max_points_per_voxel: 30
+  long_term_max_points_per_voxel: 10
   point_max_age: 50
   downsample_ratio: 0.5
   patch_pyrimid_level: 2
@@ -107,6 +112,11 @@ visual:
 mapping:
   local_map_half_size: 60
   sliding_thresh: 20
+
+long_term_map:
+  map_sliding_en: true
+  half_map_size: 400
+  sliding_thresh: 40
 ```
 
 ## 4) 实施顺序（固定顺序）

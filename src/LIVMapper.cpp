@@ -90,6 +90,10 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("visual/downsample_ratio", downsample_ratio, 0.5);
   nh.param<int>("visual/patch_pyrimid_level", patch_pyrimid_level, patch_pyrimid_level);
   nh.param<int>("visual/patch_size", patch_size, patch_size);
+  nh.param<int>("visual/long_term_max_points_per_voxel", long_term_max_points_per_voxel, 10);
+  nh.param<bool>("long_term_map/map_sliding_en", long_term_map_sliding_en, false);
+  nh.param<int>("long_term_map/half_map_size", long_term_half_map_size, 400);
+  nh.param<double>("long_term_map/sliding_thresh", long_term_sliding_thresh, 40.0);
 
   nh.param<double>("time_offset/exposure_time_init", exposure_time_init, 0.0);
   nh.param<double>("time_offset/img_time_offset", img_time_offset, 0.0);
@@ -157,6 +161,10 @@ void LIVMapper::initializeComponents()
   vio_manager->max_points_per_voxel = max_points_per_voxel;
   vio_manager->point_max_age = point_max_age;
   vio_manager->downsample_ratio = downsample_ratio;
+  vio_manager->long_term_max_points_per_voxel = long_term_max_points_per_voxel;
+  vio_manager->long_term_map_sliding_en = long_term_map_sliding_en;
+  vio_manager->long_term_half_map_size = long_term_half_map_size;
+  vio_manager->long_term_sliding_thresh = long_term_sliding_thresh;
   vio_manager->setImuToLidarExtrinsic(extT, extR);
   vio_manager->setLidarToCameraExtrinsic(cameraextrinR, cameraextrinT);
   vio_manager->state = &_state;
@@ -493,6 +501,7 @@ void LIVMapper::handleLIO()
       vio_manager->TrimVisualMap(_state.pos_end, radius);
     }
   }
+  vio_manager->UpdateLongTermMapSliding(_state.pos_end);
   
   PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
   int size = laserCloudFullRes->points.size();

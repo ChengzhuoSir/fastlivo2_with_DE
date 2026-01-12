@@ -111,6 +111,12 @@ public:
   int max_points_per_voxel = 30;
   int point_max_age = 50;
   double downsample_ratio = 0.5;
+  int long_term_max_points_per_voxel = 10;
+  bool long_term_map_sliding_en = false;
+  int long_term_half_map_size = 400;
+  double long_term_sliding_thresh = 40.0;
+  V3D long_term_last_slide_position_ = {0,0,0};
+  bool has_long_term_slide_position_ = false;
   
   SubSparseMap *visual_submap;
   std::vector<std::vector<V3D>> rays_with_sample_points;
@@ -128,6 +134,7 @@ public:
 
   ofstream fout_camera, fout_colmap;
   unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> feat_map;
+  unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> long_term_feat_map;
   unordered_map<VOXEL_LOCATION, int> sub_feat_map; 
   unordered_map<int, Warp *> warp_map;
   vector<VisualPoint *> retrieve_voxel_points;
@@ -165,6 +172,7 @@ public:
   void warpAffine(const Matrix2d &A_cur_ref, const cv::Mat &img_ref, const Vector2d &px_ref, const int level_ref, const int search_level,
                   const int pyramid_level, const int halfpatch_size, float *patch);
   void insertPointIntoVoxelMap(VisualPoint *pt_new);
+  void insertPointIntoLongTermMap(VisualPoint *pt_new);
   void plotTrackedPoints();
   void updateFrameState(StatesGroup state);
   void projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
@@ -175,6 +183,7 @@ public:
   int getBestSearchLevel(const Matrix2d &A_cur_ref, const int max_level);
   V3F getInterpolatedPixel(cv::Mat img, V2D pc);
   void TrimVisualMap(const V3D &center, double radius);
+  void UpdateLongTermMapSliding(const V3D &center);
   V2D ProjectWorldToImage(const V3D &xyz_w) const;
   bool IsInImage(const V2D &px, int border) const;
 
@@ -184,6 +193,9 @@ private:
   V2D frameToCam(const V3D &xyz_f) const;
   V3D camToWorld(const V2D &px) const;
   bool isInFrame(const V2D &px, int border) const;
+  void TrimLongTermMap(const V3D &center, double radius);
+  void RemovePointFromMap(unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> &map, VisualPoint *pt);
+  void RemovePointFromMaps(VisualPoint *pt);
   
   // void resetRvizDisplay();
   // deque<VisualPoint *> map_cur_frame;
